@@ -93,5 +93,12 @@ oci_host() { printf '%s.%s.oraclecloud.com' "$1" "$OCI_REGION"; }
 # json_str <key>   reads the first "key":"value" pair from stdin.
 # Good enough for OCIDs and states; not a general JSON parser.
 json_str() {
-    tr ',' '\n' | grep -o "\"$1\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
+    # Oracle answers compactly on some services and pretty-printed on others
+    # ("key":"value" versus "key" : "value"). Matching only the compact form
+    # returns nothing at all on the services that pad their colons -- with no
+    # error, which makes it look like the field is simply absent.
+    tr ',' '\n' \
+        | grep -oE "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+        | head -1 \
+        | sed -E 's/.*:[[:space:]]*"(.*)"$/\1/'
 }
