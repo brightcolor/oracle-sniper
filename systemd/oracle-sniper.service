@@ -1,0 +1,30 @@
+[Unit]
+Description=oracle-sniper - try to launch an Always Free instance
+Documentation=https://github.com/brightcolor/oracle-sniper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/oracle-sniper run
+
+# The job is a handful of curl calls. Keeping it boxed in means it can
+# never threaten the host it runs on, which is usually a small VM that
+# has better things to do.
+MemoryMax=64M
+CPUQuota=20%
+Nice=10
+
+# Allow enough time for the post-success IP lookup, which polls the API
+# for up to a minute. The systemd default of 90s would cut that short.
+TimeoutStartSec=300
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+# Needs /etc/systemd/system to disable its own timer after success.
+ReadWritePaths=/var/lib/oracle-sniper /etc/systemd/system
+
+[Install]
+WantedBy=multi-user.target

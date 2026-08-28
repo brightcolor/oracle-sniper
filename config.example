@@ -1,0 +1,73 @@
+# oracle-sniper configuration
+#
+# The installer writes this file to /etc/oracle-sniper/config.
+# You can edit it at any time; changes take effect on the next run.
+# After changing the schedule, run: systemctl restart oracle-sniper.timer
+
+# --- Oracle Cloud API credentials ---------------------------------------
+# From the OCI console: Profile -> My profile -> API keys.
+# Adding a key there shows a snippet containing exactly these values.
+OCI_USER=ocid1.user.oc1..aaaa...
+OCI_TENANCY=ocid1.tenancy.oc1..aaaa...
+OCI_FINGERPRINT=aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99
+OCI_REGION=eu-frankfurt-1
+
+# Where the instance goes. The tenancy OCID is the root compartment and
+# works fine if you have not created any sub-compartments.
+OCI_COMPARTMENT=ocid1.tenancy.oc1..aaaa...
+
+# Private half of the API key registered above.
+OCI_KEY_FILE=/etc/oracle-sniper/api_key.pem
+
+# --- What to create ------------------------------------------------------
+INSTANCE_NAME=free-instance
+
+# Always Free shapes:
+#   VM.Standard.A1.Flex      Arm, up to 2 OCPU / 12 GB across all instances
+#   VM.Standard.E2.1.Micro   AMD, 1/8 OCPU / 1 GB, two of them, separate quota
+SHAPE=VM.Standard.A1.Flex
+
+# Only used by .Flex shapes; leave empty for fixed shapes like E2.1.Micro.
+OCPUS=2
+MEMORY_GB=12
+
+# Boot volume in GB. Remember that Always Free grants 200 GB in total
+# across every boot and block volume in the tenancy.
+BOOT_VOLUME_GB=50
+
+IMAGE_ID=ocid1.image.oc1.eu-frankfurt-1.aaaa...
+SUBNET_ID=ocid1.subnet.oc1.eu-frankfurt-1.aaaa...
+ASSIGN_PUBLIC_IP=true
+
+# Installed for the image's default user. That user's name is only used
+# to render a ready-to-paste ssh command in the success notification.
+SSH_PUBLIC_KEY="ssh-ed25519 AAAA... you@example.com"
+SSH_USER=ubuntu
+
+# Optional cloud-init file, base64-encoded into the launch request and
+# executed at first boot. Handy for installing Docker straight away.
+CLOUD_INIT_FILE=
+
+# Availability domains to try, space separated, e.g.
+#   AVAILABILITY_DOMAINS="AbCd:EU-FRANKFURT-1-AD-1 AbCd:EU-FRANKFURT-1-AD-2"
+# Empty means: discover them once via the API and cache the result.
+AVAILABILITY_DOMAINS=
+
+# Turn the timer off as soon as the instance exists.
+# Leave this on. With it off, the sniper keeps creating instances, and
+# everything past the free allowance is billed.
+STOP_WHEN_DONE=true
+
+# --- Notifications -------------------------------------------------------
+# Every channel is optional; configure as many as you like. With none of
+# them set, results only show up in the journal.
+
+# https://pushover.net -- application token and your user key
+NOTIFY_PUSHOVER_TOKEN=
+NOTIFY_PUSHOVER_USER=
+
+# Full topic URL, e.g. https://ntfy.sh/some-hard-to-guess-topic
+NOTIFY_NTFY_URL=
+
+# Receives {"title": "...", "message": "..."} as JSON via POST.
+NOTIFY_WEBHOOK_URL=

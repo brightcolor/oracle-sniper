@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+#
+# oracle-sniper -- keep asking Oracle Cloud for an Always Free instance
+# until one is actually available, then stop and tell you about it.
+#
+# https://github.com/brightcolor/oracle-sniper
+
+VERSION="1.0.0"
+
+CONFIG_FILE="${ORACLE_SNIPER_CONFIG:-/etc/oracle-sniper/config}"
+LIB_DIR="${ORACLE_SNIPER_LIB:-/usr/local/lib/oracle-sniper}"
+STATE_DIR="${ORACLE_SNIPER_STATE:-/var/lib/oracle-sniper}"
+TIMER_UNIT="oracle-sniper.timer"
+
+# ---------------------------------------------------------------- helpers ---
+
+log() { printf '[%s] %s\n' "$(date -u +'%Y-%m-%d %H:%M:%S')" "$*"; }
+die() { log "ERROR: $*"; exit 1; }
+
+usage() {
+    cat <<EOF
+oracle-sniper ${VERSION}
+
+Usage: oracle-sniper <command>
+
+Commands:
+  run            Try once to launch the instance (what the timer calls)
+  status         Show timer state, target instance and recent attempts
+  check          Verify configuration and API access, change nothing
+  test-notify    Send a test notification through every configured channel
+  version        Print version
+  help           This text
+
+Configuration: ${CONFIG_FILE}
+EOF
+}
+
+# --------------------------------------------------------- notifications ---
+
+# notify <title> <message> [priority 0|1]
+notify() {
+    local title="$1" message="$2" prio="${3:-0}" sent=0
+
+    if [ -n "${NOTIFY_PUSHOVER_TOKEN:-}" ] && [ -n "${NOTIFY_PUSHOVER_USER:-}" ]; then
+        if curl -sS --max-time 20 \
+            --form-string "token=${NOTIFY_PUSHOVER_TOKEN}" \
+            --form-string "user=${NOTIFY_PUSHOVER_USER}" \
+            --form-string "title=${title}" \
+            --form-string "message=${message}" \
+            --form-string "priority=${prio}" \
+            https://api.pushover.net/1/messages.json >/dev/null 2>&1; then
+            sent=1
+        else
+            log "Pushover delivery failed."
+        fi
+    fi
+
+    if [ -n "${NOTIFY_NTFY_URL:-}" ]; then
+        if curl -sS --max-time 20 \
+            -H "Title: ${title}" \
+            -H "Priority: $([ "$prio" = "1" ] && echo high || echo default)" \
+            -d "${message}" "${NOTIFY_NTFY_URL}" >/dev/null 2>&1; then
+            sent=1
+        else
+            log "ntfy delivery failed."
+        fi
+    fi
+
+    if [ -n "${NOTIFY_WEBHOOK_URL:-}" ]; then
+        local payload
+        payload="$(printf '{"title":%s,"message":%s}' \
+            "$(json_quote "$title")" "$(json_quote "$message")")"
+        if curl -sS --max-time 20 -H 'content-type: application/json' \
+            -d "$payload" "${NOTIFY_WEBHOOK_URL}" >/dev/null 2>&1; then
+            sent=1
+        else
+            log "Webhook delivery failed."
+        fi
+    fi
+
+    [ "$sent" = "0" ] && log "No notification channel configured or all failed."
+    return 0
+}
+
+json_quote() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g' \
+        | sed -e 's/^/"/' -e 's/$/"/'
+}
+
+# ---------------------------------------------------------------- config ---
+
+load_config() {
+    [ -r "$CONFIG_FILE" ] || die "Config not found or unreadable: $CONFIG_FILE"
+    # shellcheck source=/dev/null
+    . "$CONFIG_FILE"
+    # shellcheck source=/dev/null
+    . "${LIB_DIR}/oci-api.sh" || die "Cannot load ${LIB_DIR}/oci-api.sh"
+    # oci-api.sh must not enable `set -e`; make sure of it either way.
+    set +e
+    set -uo pipefail
+
+    local missing=()
+    for v in OCI_USER OCI_TENANCY OCI_FINGERPRINT OCI_REGION OCI_KEY_FILE \
+             OCI_COMPARTMENT INSTANCE_NAME SHAPE IMAGE_ID SUBNET_ID SSH_PUBLIC_KEY; do
+        [ -z "${!v:-}" ] && missing+=("$v")
+    done
+    [ ${#missing[@]} -gt 0 ] && die "Config incomplete, missing: ${missing[*]}"
+
+    IAAS_HOST="$(oci_host iaas)"
+    IDENTITY_HOST="$(oci_host identity)"
+    mkdir -p "$STATE_DIR" 2>/dev/null
+}
+
+# Availability domains: from config, or discovered once and cached.
+resolve_ads() {
+    if [ -n "${AVAILABILITY_DOMAINS:-}" ]; then
+        printf '%s\n' $AVAILABILITY_DOMAINS
+        return 0
+    fi
+    local cache="${STATE_DIR}/availability-domains"
+    if [ -s "$cache" ]; then
+        cat "$cache"
+        return 0
+    fi
+    local resp
+    resp="$(oci_get "$IDENTITY_HOST" "/20160918/availabilityDomains?compartmentId=${OCI_COMPARTMENT}")"
+    printf '%s' "$resp" | tr ',' '\n' | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | tee "$cache"
+}
+
+# ------------------------------------------------------------ instance io ---
+
+find_instance() {
+    oci_get "$IAAS_HOST" \
+        "/20160918/instances?compartmentId=${OCI_COMPARTMENT}&displayName=${INSTANCE_NAME}"
+}
+
+instance_alive() {
+    printf '%s' "$1" | tr '{' '\n' \
+        | grep -q '"lifecycleState":"\(RUNNING\|PROVISIONING\|STARTING\|STOPPED\|STOPPING\)"'
+}
+
+instance_id_of() {
+    printf '%s' "$1" | tr ',' '\n' | grep -o '"id":"ocid1.instance[^"]*"' | head -1 | cut -d'"' -f4
+}
+
+public_ip_of() {
+    local instance_id="$1" tries="${2:-10}" vnic ip
+    for _ in $(seq 1 "$tries"); do
+        vnic="$(oci_get "$IAAS_HOST" \
+            "/20160918/vnicAttachments?compartmentId=${OCI_COMPARTMENT}&instanceId=${instance_id}" \
+            2>/dev/null | json_str vnicId)"
+        if [ -n "$vnic" ]; then
+            ip="$(oci_get "$IAAS_HOST" "/20160918/vnics/${vnic}" 2>/dev/null | json_str publicIp)"
+            [ -n "$ip" ] && { printf '%s' "$ip"; return 0; }
+        fi
+        sleep 5
+    done
+    return 1
+}
+
+launch_body() {
+    local ad="$1" shape_config="" metadata cloud_init=""
+
+    if [ -n "${OCPUS:-}" ] && [ -n "${MEMORY_GB:-}" ]; then
+        shape_config=",\"shapeConfig\":{\"ocpus\":${OCPUS},\"memoryInGBs\":${MEMORY_GB}}"
+    fi
+    if [ -n "${CLOUD_INIT_FILE:-}" ] && [ -r "$CLOUD_INIT_FILE" ]; then
+        cloud_init=",\"user_data\":$(json_quote "$(base64 -w0 < "$CLOUD_INIT_FILE")")"
+    fi
+    metadata="\"metadata\":{\"ssh_authorized_keys\":$(json_quote "$SSH_PUBLIC_KEY")${cloud_init}}"
+
+    cat <<JSON | tr -d '\n'
+{"availabilityDomain":$(json_quote "$ad"),
+ "compartmentId":$(json_quote "$OCI_COMPARTMENT"),
+ "displayName":$(json_quote "$INSTANCE_NAME"),
+ "shape":$(json_quote "$SHAPE")${shape_config},
+ "sourceDetails":{"sourceType":"image","imageId":$(json_quote "$IMAGE_ID"),"bootVolumeSizeInGBs":${BOOT_VOLUME_GB:-50}},
+ "createVnicDetails":{"subnetId":$(json_quote "$SUBNET_ID"),"assignPublicIp":${ASSIGN_PUBLIC_IP:-true}},
+ ${metadata}}
+JSON
+}
+
+stop_timer() {
+    [ "${STOP_WHEN_DONE:-true}" = "true" ] || return 0
+    systemctl disable --now "$TIMER_UNIT" >/dev/null 2>&1 \
+        && log "Timer disabled." \
+        || log "Could not disable timer (not running under systemd?)."
+}
+
+announce() {
+    local instance_id="$1" where="$2" ip
+    if ip="$(public_ip_of "$instance_id")"; then
+        log "Public IP: ${ip}"
+        notify "Instance acquired" \
+"${INSTANCE_NAME} is up${where}.
+IP: ${ip}
+ssh ${SSH_USER:-ubuntu}@${ip}
+${SHAPE} ${OCPUS:+/ ${OCPUS} OCPU}${MEMORY_GB:+ / ${MEMORY_GB} GB}" 1
+    else
+        log "Public IP not available yet."
+        notify "Instance acquired" \
+"${INSTANCE_NAME} was created${where}, but no public IP was readable yet.
+Instance: ${instance_id}" 1
+    fi
+}
+
+# ------------------------------------------------------------------- run ---
+
+CLEAN_EXIT=0
+on_exit() {
+    local rc=$?
+    [ "$CLEAN_EXIT" = "1" ] && exit "$rc"
+    log "Unexpected termination (exit ${rc})."
+    notify "oracle-sniper aborted" \
+"The run ended unexpectedly with exit ${rc}.
+Check: journalctl -u oracle-sniper.service -n 30
+Note: the instance may have been created anyway." 1
+    exit "$rc"
+}
+
+cmd_run() {
+    load_config
+    trap on_exit EXIT
+
+    exec 9>"${STATE_DIR}/lock"
+    if ! flock -n 9; then
+        log "Another run is in progress, skipping."
+        CLEAN_EXIT=1; exit 0
+    fi
+
+    # Never create a second instance. Without this the timer would keep
+    # launching more of them after the first success -- which costs money.
+    local existing
+    existing="$(find_instance 2>/dev/null)"
+    if [ -n "$existing" ] && instance_alive "$existing"; then
+        local id; id="$(instance_id_of "$existing")"
+        log "Instance '${INSTANCE_NAME}' already exists (${id})."
+        stop_timer
+        # Report it anyway: it may have been created by a run that died
+        # before it could send anything.
+        announce "$id" ""
+        CLEAN_EXIT=1; exit 0
+    fi
+
+    local ad body response http_code payload id
+    while read -r ad; do
+        [ -z "$ad" ] && continue
+        body="$(launch_body "$ad")"
+        response="$(oci_post "$IAAS_HOST" "/20160918/instances" "$body")"
+        if [ $? -ne 0 ]; then
+            # Connection died. Oracle may still have accepted the request,
+            # so do not treat this as "no capacity" -- the next run checks.
+            log "${ad}: connection error, instance may have been created anyway."
+            continue
+        fi
+
+        http_code="$(printf '%s' "$response" | tail -n1)"
+        payload="$(printf '%s' "$response" | sed '$d')"
+
+        case "$http_code" in
+            200)
+                id="$(printf '%s' "$payload" | json_str id)"
+                log "SUCCESS: '${INSTANCE_NAME}' created in ${ad} (${id})."
+                stop_timer
+                announce "$id" " in ${ad}"
+                CLEAN_EXIT=1; exit 0
+                ;;
+            429)
+                log "${ad}: rate limited (HTTP 429), ending this round early."
+                break
+                ;;
+            *)
+                if printf '%s' "$payload" | grep -qi "out of host capacity\|OutOfHostCapacity"; then
+                    log "${ad}: no capacity."
+                else
+                    log "${ad}: HTTP ${http_code} - ${payload}"
+                    local marker="${STATE_DIR}/last-error"
+                    if [ "$(cat "$marker" 2>/dev/null)" != "$http_code" ]; then
+                        printf '%s' "$http_code" > "$marker"
+                        notify "oracle-sniper: unexpected error" \
+                            "HTTP ${http_code} in ${ad}
+${payload}" 0
+                    fi
+                fi
+                ;;
+        esac
+    done < <(resolve_ads)
+
+    log "No luck this round."
+    CLEAN_EXIT=1; exit 0
+}
+
+cmd_check() {
+    load_config
+    echo "Config file : $CONFIG_FILE"
+    echo "Region      : $OCI_REGION"
+    echo "Target      : $INSTANCE_NAME ($SHAPE${OCPUS:+, ${OCPUS} OCPU}${MEMORY_GB:+, ${MEMORY_GB} GB})"
+    echo
+    printf 'API access  : '
+    local ads; ads="$(resolve_ads)"
+    if [ -z "$ads" ]; then
+        echo "FAILED - check credentials, key file and compartment OCID"
+        return 1
+    fi
+    echo "ok"
+    echo "Domains     :"; printf '  %s\n' $ads
+    printf 'Subnet      : '
+    oci_get "$IAAS_HOST" "/20160918/subnets/${SUBNET_ID}" | json_str displayName || echo '?'
+    printf 'Image       : '
+    oci_get "$IAAS_HOST" "/20160918/images/${IMAGE_ID}" | json_str displayName || echo '?'
+    printf 'Instance    : '
+    local existing; existing="$(find_instance 2>/dev/null)"
+    if [ -n "$existing" ] && instance_alive "$existing"; then
+        echo "already exists ($(instance_id_of "$existing"))"
+    else
+        echo "not created yet"
+    fi
+    echo
+    echo "Notifications:"
+    [ -n "${NOTIFY_PUSHOVER_TOKEN:-}" ] && echo "  pushover : configured"
+    [ -n "${NOTIFY_NTFY_URL:-}" ]       && echo "  ntfy     : ${NOTIFY_NTFY_URL}"
+    [ -n "${NOTIFY_WEBHOOK_URL:-}" ]    && echo "  webhook  : configured"
+    [ -z "${NOTIFY_PUSHOVER_TOKEN:-}${NOTIFY_NTFY_URL:-}${NOTIFY_WEBHOOK_URL:-}" ] \
+        && echo "  none - you will only see results in the journal"
+    return 0
+}
+
+cmd_status() {
+    load_config
+    systemctl list-timers "$TIMER_UNIT" --all --no-pager 2>/dev/null | head -3
+    echo
+    local existing; existing="$(find_instance 2>/dev/null)"
+    if [ -n "$existing" ] && instance_alive "$existing"; then
+        local id; id="$(instance_id_of "$existing")"
+        echo "Instance : ${INSTANCE_NAME} exists (${id})"
+        local ip; ip="$(public_ip_of "$id" 1)" && echo "IP       : ${ip}"
+    else
+        echo "Instance : ${INSTANCE_NAME} not created yet"
+    fi
+    echo
+    echo "Recent attempts:"
+    journalctl -u oracle-sniper.service --no-pager -n 12 --output=cat 2>/dev/null \
+        | sed 's/^/  /' || echo "  (journal unavailable)"
+}
+
+cmd_test_notify() {
+    load_config
+    notify "oracle-sniper test" \
+"This is a test from $(hostname).
+If you can read this, you will also hear about ${INSTANCE_NAME} when it lands." 0
+    echo "Test notification dispatched."
+}
+
+# ----------------------------------------------------------------- entry ---
+
+case "${1:-run}" in
+    run)          cmd_run ;;
+    check)        cmd_check ;;
+    status)       cmd_status ;;
+    test-notify)  cmd_test_notify ;;
+    version)      echo "oracle-sniper ${VERSION}" ;;
+    help|-h|--help) usage ;;
+    *)            usage; exit 1 ;;
+esac

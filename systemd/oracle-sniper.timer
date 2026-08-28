@@ -1,0 +1,15 @@
+[Unit]
+Description=oracle-sniper schedule
+Documentation=https://github.com/brightcolor/oracle-sniper
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+# Spread the load a little so every sniper on the planet does not hit
+# Oracle on the same tick.
+RandomizedDelaySec=120
+Persistent=true
+Unit=oracle-sniper.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,5 @@
+# Never let real credentials or keys near the repository
+config
+*.pem
+*.key
+.env
