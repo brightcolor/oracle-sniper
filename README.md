@@ -8,7 +8,7 @@ Out of host capacity.
 
 Capacity does free up, constantly, but in seconds-wide windows as other people's instances get terminated. Whoever asks at the right moment wins. That is not a job for a human refreshing a browser tab.
 
-**oracle-sniper** asks for you. It runs on any Linux box you already own, retries on a schedule across every availability domain in your region, stops itself the moment it succeeds, and tells you where your new machine is.
+**oracle-sniper** asks for you. It runs on any Linux box you already own — as a systemd timer or as a container — retries across every availability domain in your region, stops itself the moment it succeeds, and tells you where your new machine is.
 
 ```
 [2026-08-22 06:19:59] AbCd:EU-FRANKFURT-1-AD-1: no capacity.
@@ -23,47 +23,97 @@ Capacity does free up, constantly, but in seconds-wide windows as other people's
 
 ---
 
+## ⏳ Bring patience
+
+This matters more than any configuration option, so it goes first.
+
+In the run this tool was built for, the timer started on **8 August** and the instance appeared on **22 August** — **two weeks** of "no capacity", roughly 2,000 failed attempts, in Frankfurt across all three availability domains. Reports from others range from a few hours to well over a month.
+
+So: **set it up, then forget about it.** Do not shorten the interval because nothing happened on day three; Oracle rate-limits aggressive polling and you will only make it worse. The whole point of this tool is that waiting costs you nothing — one second of CPU time per attempt, capped at 64 MB of memory, and a notification when it finally lands.
+
+If you want it faster, the only reliable lever is upgrading the account to Pay-as-you-go. Always Free resources stay free, but capacity becomes available immediately.
+
+---
+
 ## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/brightcolor/oracle-sniper/main/install.sh | sudo bash
 ```
 
-The installer walks you through everything, verifies your API access before writing anything permanent, and offers to start the timer at the end. Re-running it later is safe — it offers to keep your existing configuration.
+The installer asks how you want to run it, checks the prerequisites for that choice, and offers to install anything missing. Run it again later to reconfigure or to remove everything.
+
+### Two ways to run it
+
+|  | systemd timer | Docker |
+|---|---|---|
+| Needs | systemd, curl, openssl | Docker with the compose plugin |
+| Runs | every N minutes via timer | container loop, exits on success |
+| Logs | `journalctl -u oracle-sniper` | `docker logs oracle-sniper` |
+
+Both use the same configuration file and behave identically. Pick whatever fits the host.
+
+If Docker is missing and you choose that mode, the installer offers to install it via the official convenience script — or to cancel, so nothing happens behind your back.
 
 ### Requirements
 
-Nothing you have to install first, on any mainstream distribution:
+On a systemd host: `bash`, `curl`, `openssl`, `flock`, `base64`. Nothing you have to fetch first on any mainstream distribution — and if something is missing, the installer offers to install it through your package manager.
 
-- `bash`, `curl`, `openssl`, `flock`, `base64`
-- `systemd` (for the timer)
-- An Oracle Cloud account with a VCN and a subnet already created
-
-No Python, no OCI CLI, no SDK, no package installs. Requests are signed with `openssl` directly. The whole thing is about 20 KB of shell and idles at zero cost — a run takes roughly one second of CPU time and is capped at 64 MB of memory, so it is at home on the smallest VPS you have lying around.
+No Python, no OCI CLI, no SDK. Requests are signed with `openssl` directly. The whole thing is about 20 KB of shell.
 
 ---
 
-## What the installer asks
+## Docker
 
-| Step | What it needs | Notes |
-|---|---|---|
-| 1. Credentials | User OCID, tenancy OCID, region | Oracle shows all of these in one snippet when you add an API key |
-| 2. API key | Reuse one, point at one, or generate a fresh RSA key | It prints the public half and the fingerprint for you to register |
-| 3. Verification | — | Lists your availability domains; nothing is written until this works |
-| 4. Network | Subnet | Discovered via the API, presented as a numbered list |
-| 5. Shape | Shape, OCPUs, memory, boot volume, name | Defaults to the Always Free A1 |
-| 6. Image | OS and version | Looked up via the API; you pick from actual matching builds |
-| 7. SSH | Public key file or pasted key | Also the image's default login user |
-| 8. Notifications | Pushover, ntfy, webhook | All optional, all can be combined |
-| 9. Schedule | Retry interval | Ten minutes by default |
+The image is published for **linux/amd64 and linux/arm64**, so it runs on Ampere and Graviton instances as well as ordinary x86 hosts.
 
-Everything lands in `/etc/oracle-sniper/config`, which is a plain shell file you can edit afterwards. See [`config.example`](config.example) for every option with commentary.
+```bash
+docker pull ghcr.io/brightcolor/oracle-sniper:latest
+```
 
-### Getting the API key registered
+Mount a config file, or pass everything as environment variables:
 
-In the OCI console: **Profile → My profile → API keys → Add API key → Paste a public key**. Paste the block the installer prints, then confirm. Oracle immediately shows a configuration snippet containing your user OCID, tenancy OCID and fingerprint — exactly the values step 1 asked for.
+```yaml
+services:
+  oracle-sniper:
+    image: ghcr.io/brightcolor/oracle-sniper:latest
+    restart: on-failure          # NOT unless-stopped -- see below
+    environment:
+      CHECK_INTERVAL_SECONDS: 600
+      OCI_USER: ocid1.user.oc1..aaaa...
+      OCI_TENANCY: ocid1.tenancy.oc1..aaaa...
+      OCI_FINGERPRINT: aa:bb:cc:...
+      OCI_REGION: eu-frankfurt-1
+      OCI_COMPARTMENT: ocid1.tenancy.oc1..aaaa...
+      OCI_KEY_BASE64: LS0tLS1CRUdJTi...    # base64 of the private key
+      INSTANCE_NAME: free-instance
+      SHAPE: VM.Standard.A1.Flex
+      OCPUS: 2
+      MEMORY_GB: 12
+      IMAGE_ID: ocid1.image.oc1...
+      SUBNET_ID: ocid1.subnet.oc1...
+      SSH_PUBLIC_KEY: "ssh-ed25519 AAAA... you@example.com"
+      NOTIFY_PUSHOVER_TOKEN: ...
+      NOTIFY_PUSHOVER_USER: ...
+    volumes:
+      - sniper-state:/var/lib/oracle-sniper
+    mem_limit: 64m
 
-Freshly added keys occasionally need a minute before they authenticate. If step 3 fails right after registering one, wait and re-run `oracle-sniper check`.
+volumes:
+  sniper-state:
+```
+
+**Use `restart: on-failure`, not `unless-stopped`.** When the sniper wins, the container exits with code 0 on purpose. A restart-always policy would bring it straight back up, and it would spend the rest of its life re-discovering that the instance already exists.
+
+The state volume matters for the same reason: it holds the marker that says "already won". Without it, a recreated container starts hunting again.
+
+---
+
+## Uninstall
+
+Run the installer again and pick *Uninstall*. It removes the program, the systemd units and the container, and then asks separately whether your **configuration, API key and state** should go too — because keeping them lets you reinstall later without redoing the setup.
+
+Your Oracle Cloud instance is never touched. If you delete the credentials, the installer reminds you to revoke the API key in the OCI console.
 
 ---
 
@@ -76,17 +126,7 @@ oracle-sniper check         # verify config and API access, change nothing
 oracle-sniper test-notify   # send a test through every configured channel
 ```
 
-Follow the hunt live:
-
-```bash
-journalctl -u oracle-sniper.service -f
-```
-
-Stop it:
-
-```bash
-sudo systemctl disable --now oracle-sniper.timer
-```
+In Docker, pass the same words to the container: `docker run ... oracle-sniper check`.
 
 ---
 
@@ -94,18 +134,18 @@ sudo systemctl disable --now oracle-sniper.timer
 
 Each run does four things:
 
-1. **Checks whether the instance already exists.** If it does, the timer is switched off and you get a notification. This guard is the most important line of defence in the whole program — see the warning below.
+1. **Checks whether the instance already exists.** If it does, everything stops and you get a notification. This guard is the most important line of defence in the whole program — see the warning below.
 2. **Walks the availability domains.** A region with three of them gives three independent capacity pools and therefore three chances per round.
 3. **Calls `launchInstance`.** `Out of host capacity` is expected and logged quietly. Anything else is reported once per distinct error, so a misconfiguration or an expired key does not sit unnoticed for weeks.
-4. **On success, resolves the public IP** by polling the VNIC attachment, sends it to you and disables the timer.
+4. **On success, resolves the public IP**, sends it to you, and stops — by disabling the timer, or by exiting the container.
 
 ### Requests are signed, not proxied
 
-Oracle's API uses HTTP Signatures (`draft-cavage-http-signatures`). `bin/oci-api.sh` builds the signing string, signs it with your RSA key via `openssl`, and attaches the `Authorization` header. Roughly 40 lines, no dependencies, and it works identically on x86 and Arm.
+Oracle's API uses HTTP Signatures (`draft-cavage-http-signatures`). `bin/oci-api.sh` builds the signing string, signs it with your RSA key via `openssl`, and attaches the `Authorization` header. Roughly 40 lines, no dependencies, identical on x86 and Arm.
 
 ### Failure handling
 
-This is where the design earned its scars. The first version inherited `set -e` from a sourced helper, and a single dropped connection killed the run silently — mid-flight, without a log line. Oracle had already created the instance; the notification never went out; the next run only saw "instance already exists" and quietly switched the timer off. The success was invisible for two weeks.
+This is where the design earned its scars. The first version inherited `set -e` from a sourced helper, and a single dropped connection killed the run silently — mid-flight, without a log line. Oracle had already created the instance; the notification never went out; the next run only saw "instance already exists" and quietly stopped. The success was invisible for two weeks.
 
 So now:
 
@@ -113,6 +153,10 @@ So now:
 - An `EXIT` trap reports **any** unclean termination, so a silent death is impossible.
 - A connection error during `launchInstance` is not treated as failure. Oracle may have accepted the request anyway, so the run moves on and the next one detects the instance and reports it.
 - The "already exists" path notifies too, precisely because it might be the first time anyone hears about it.
+
+A second scar: Oracle answers compactly on some services and pretty-printed on others (`"key":"value"` versus `"key" : "value"`). Matching only the compact form returned nothing at all on the padded services — with no error, so it looked like the field was simply absent. The parser now accepts both.
+
+A third, found while testing the container image: the "does the instance already exist" check used `grep '\(RUNNING\|PROVISIONING\)'`. That is GNU grep syntax. Alpine ships **busybox grep**, which does not support `\|` alternation in basic expressions — so inside the container the pattern never matched. The sniper would have concluded that no instance existed and launched a **second one** next to the one it already owned, which Oracle bills. Every pattern now uses `grep -E`. If you package this for another minimal base image, keep that in mind.
 
 ---
 
@@ -128,7 +172,7 @@ The create form happily states *"You can create Ampere A1 compute instances in a
 
 ### Oracle rate-limits
 
-Hammering the API earns you `HTTP 429`. The sniper ends a round early when it sees one, and the default interval of ten minutes stays well clear. Do not set it to 30 seconds; you will get throttled and win nothing.
+Hammering the API earns you `HTTP 429`. The sniper ends a round early when it sees one, and the default interval of ten minutes stays well clear.
 
 ### Always Free has been cut
 
@@ -136,7 +180,11 @@ Since **15 June 2026** the A1 allowance is **2 OCPU / 12 GB**, down from 4 / 24.
 
 ### Idle instances get reclaimed
 
-On accounts that never upgraded to Pay-as-you-go, Oracle may reclaim instances that stay below 20% CPU, network *and* memory utilisation across a 7-day window. Winning the machine is not the same as keeping it — give it something to do.
+On accounts that never upgraded to Pay-as-you-go, Oracle may reclaim instances that stay below 20% CPU, network *and* memory utilisation across a 7-day window. Winning the machine is not the same as keeping it.
+
+### Hold the matching private key
+
+The installer takes a public key and installs it on the instance. Make sure you actually have the private half — an instance you cannot log into has to be rebuilt, and rebuilding means winning the capacity lottery all over again.
 
 ---
 
@@ -152,37 +200,19 @@ Full commentary lives in [`config.example`](config.example). The options you are
 | `STOP_WHEN_DONE` | Leave at `true` |
 | `NOTIFY_*` | Pushover, ntfy and webhook targets |
 
-Changing the retry interval means editing the timer:
-
-```bash
-sudo systemctl edit --full oracle-sniper.timer   # adjust OnUnitActiveSec
-sudo systemctl restart oracle-sniper.timer
-```
-
 ---
 
 ## Troubleshooting
 
 **`check` reports the API call failed.** In order of likelihood: the key is not registered in the OCI profile yet, the fingerprint does not match the private key, or the region is wrong. Note that the OCIDs for user and tenancy are different values that look confusingly alike.
 
-**Every round says "no capacity" for days.** That is the normal experience in busy regions. Regions with three availability domains give better odds than single-AD ones. Upgrading to Pay-as-you-go removes the problem entirely — Always Free resources stay free, but capacity becomes available immediately.
+**Every round says "no capacity" for days.** That is normal — see the patience section at the top.
 
 **The instance exists but you cannot reach it.** Two firewall layers must be open, and forgetting one costs hours: the OCI **security list** on the subnet, and **iptables inside the VM** — Oracle's Linux images ship with rules that reject everything except SSH.
 
+**The container keeps restarting after success.** Your restart policy is `always` or `unless-stopped`. Use `on-failure`.
+
 **Notifications never arrive.** `oracle-sniper test-notify` exercises every configured channel and reports which one failed.
-
----
-
-## Uninstall
-
-```bash
-sudo systemctl disable --now oracle-sniper.timer
-sudo rm -f /usr/local/bin/oracle-sniper /etc/systemd/system/oracle-sniper.{service,timer}
-sudo rm -rf /usr/local/lib/oracle-sniper /var/lib/oracle-sniper
-sudo systemctl daemon-reload
-```
-
-Your credentials in `/etc/oracle-sniper/` are left alone deliberately. Remove them yourself when you are sure you are done, and revoke the API key in the OCI console.
 
 ---
 

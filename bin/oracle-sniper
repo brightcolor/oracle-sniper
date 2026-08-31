@@ -5,7 +5,7 @@
 #
 # https://github.com/brightcolor/oracle-sniper
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 CONFIG_FILE="${ORACLE_SNIPER_CONFIG:-/etc/oracle-sniper/config}"
 LIB_DIR="${ORACLE_SNIPER_LIB:-/usr/local/lib/oracle-sniper}"
@@ -134,13 +134,19 @@ find_instance() {
         "/20160918/instances?compartmentId=${OCI_COMPARTMENT}&displayName=${INSTANCE_NAME}"
 }
 
+# Note the -E: busybox grep (Alpine, i.e. the container image) does not
+# support \| alternation in basic expressions, so a BRE pattern here would
+# silently never match -- and the sniper would launch a second instance
+# next to the one it already owns. That one costs money.
 instance_alive() {
     printf '%s' "$1" | tr '{' '\n' \
-        | grep -q '"lifecycleState":"\(RUNNING\|PROVISIONING\|STARTING\|STOPPED\|STOPPING\)"'
+        | grep -qE '"lifecycleState"[[:space:]]*:[[:space:]]*"(RUNNING|PROVISIONING|STARTING|STOPPED|STOPPING)"'
 }
 
 instance_id_of() {
-    printf '%s' "$1" | tr ',' '\n' | grep -o '"id":"ocid1.instance[^"]*"' | head -1 | cut -d'"' -f4
+    printf '%s' "$1" | tr ',' '\n' \
+        | grep -oE '"id"[[:space:]]*:[[:space:]]*"ocid1\.instance[^"]*"' \
+        | head -1 | sed -E 's/.*"(ocid1\.instance[^"]*)"$/\1/'
 }
 
 public_ip_of() {
@@ -180,8 +186,20 @@ launch_body() {
 JSON
 }
 
+# Inside a container there is no systemd to talk to, and "stop hunting"
+# means letting the process exit rather than disabling a timer.
+in_container() {
+    [ -f /.dockerenv ] && return 0
+    grep -qaE 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null
+}
+
 stop_timer() {
     [ "${STOP_WHEN_DONE:-true}" = "true" ] || return 0
+    if in_container; then
+        : > "${STATE_DIR}/done"
+        log "Marked as done. The container exits and will not restart."
+        return 0
+    fi
     systemctl disable --now "$TIMER_UNIT" >/dev/null 2>&1 \
         && log "Timer disabled." \
         || log "Could not disable timer (not running under systemd?)."
@@ -270,7 +288,7 @@ cmd_run() {
                 break
                 ;;
             *)
-                if printf '%s' "$payload" | grep -qi "out of host capacity\|OutOfHostCapacity"; then
+                if printf '%s' "$payload" | grep -qiE "out of host capacity|OutOfHostCapacity"; then
                     log "${ad}: no capacity."
                 else
                     log "${ad}: HTTP ${http_code} - ${payload}"

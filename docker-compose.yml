@@ -1,0 +1,30 @@
+# oracle-sniper in Docker.
+#
+# Two ways to configure it:
+#   a) mount ./config and ./api_key.pem into /etc/oracle-sniper  (shown here)
+#   b) pass everything as environment variables (see README)
+#
+# Note the restart policy: on success the container exits with code 0 and
+# must stay down. "unless-stopped" would restart it forever.
+
+services:
+  oracle-sniper:
+    image: ghcr.io/brightcolor/oracle-sniper:latest
+    container_name: oracle-sniper
+    restart: on-failure
+    environment:
+      # How long to wait between attempts. Oracle rate-limits aggressive
+      # polling; ten minutes is a sane default.
+      CHECK_INTERVAL_SECONDS: 600
+    volumes:
+      - ./config:/etc/oracle-sniper/config:ro
+      - ./api_key.pem:/etc/oracle-sniper/api_key.pem:ro
+      # Keeps the "already won" marker and the discovered availability
+      # domains across restarts.
+      - sniper-state:/var/lib/oracle-sniper
+    # It is a handful of curl calls; it never needs more than this.
+    mem_limit: 64m
+    cpus: 0.2
+
+volumes:
+  sniper-state:

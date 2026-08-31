@@ -1,0 +1,102 @@
+name: Container image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'Dockerfile'
+      - 'bin/**'
+      - 'docker/**'
+      - '.github/workflows/docker.yml'
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/oracle-sniper
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax check
+        run: |
+          set -euo pipefail
+          for f in bin/oracle-sniper bin/oci-api.sh docker/entrypoint.sh install.sh; do
+            bash -n "$f" && echo "ok  $f"
+          done
+
+      # Nothing is compiled in this image -- it is Alpine plus shell scripts --
+      # so emulation costs nothing and one job covers both architectures.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        run: |
+          set -euo pipefail
+          tags="${IMAGE}:latest"
+          version="$(sed -n 's/^VERSION="\(.*\)"/\1/p' bin/oracle-sniper | head -1)"
+          [ -n "$version" ] && tags="${tags},${IMAGE}:${version}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            t="${GITHUB_REF_NAME#v}"
+            tags="${tags},${IMAGE}:${t}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Building: ${tags}"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Verify both architectures
+        run: |
+          set -euo pipefail
+          echo "Published platforms:"
+          docker buildx imagetools inspect "${IMAGE}:latest" \
+            | grep -o 'linux/[a-z0-9]*' | sort -u | sed 's/^/  /'
+          for want in linux/amd64 linux/arm64; do
+            docker buildx imagetools inspect "${IMAGE}:latest" | grep -q "$want" \
+              || { echo "MISSING: $want"; exit 1; }
+          done
+          echo "Both architectures present."
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint oracle-sniper "${IMAGE}:latest" version
+          docker run --rm --entrypoint sh "${IMAGE}:latest" -c \
+            'for t in bash curl openssl flock base64; do command -v $t >/dev/null || { echo "missing: $t"; exit 1; }; done; echo "all tools present"'
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image published"
+            echo
+            echo '```'
+            echo "docker pull ${IMAGE}:latest"
+            echo '```'
+            echo
+            echo "Platforms: linux/amd64, linux/arm64"
+          } >> "$GITHUB_STEP_SUMMARY"
