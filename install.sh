@@ -10,7 +10,7 @@
 
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.1"
 REPO_RAW="${ORACLE_SNIPER_REPO_RAW:-https://raw.githubusercontent.com/brightcolor/oracle-sniper/main}"
 IMAGE="${ORACLE_SNIPER_IMAGE:-ghcr.io/brightcolor/oracle-sniper:latest}"
 

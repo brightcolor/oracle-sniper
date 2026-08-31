@@ -16,6 +16,28 @@ log() { printf '[%s] %s\n' "$(date -u +'%Y-%m-%d %H:%M:%S')" "$*"; }
 
 mkdir -p "$CONFIG_DIR" "$STATE_DIR"
 
+# These need neither configuration nor an unpaused state -- and `resume`
+# in particular must work while paused, or there is no way back out.
+case "${1:-}" in
+    pause|resume|version|help|-h|--help) exec oracle-sniper "$@" ;;
+esac
+
+# --- Brakes ---------------------------------------------------------------
+# Both files live in the state volume, so they survive restarts, recreated
+# containers and rebuilt images. Checked before the configuration: a stopped
+# sniper should stay quiet rather than complain about settings it is not
+# going to use.
+if [ -f "${STATE_DIR}/done" ]; then
+    log "Instance was already acquired in an earlier run. Nothing to do."
+    log "Delete ${STATE_DIR}/done to hunt again."
+    exit 0
+fi
+if [ -f "${STATE_DIR}/paused" ]; then
+    log "Paused: $(cat "${STATE_DIR}/paused" 2>/dev/null)"
+    log "Delete ${STATE_DIR}/paused, or run 'oracle-sniper resume', to continue."
+    exit 0
+fi
+
 # --- Config: mounted file wins, otherwise build it from the environment ---
 if [ ! -f "$CONFIG_FILE" ]; then
     missing=()
@@ -72,19 +94,6 @@ fi
 if [ ! -r "${OCI_KEY_FILE:-$KEY_FILE}" ]; then
     log "No API key found. Mount one at ${KEY_FILE} or pass OCI_KEY_BASE64."
     exit 1
-fi
-
-# Two brake files, both in the state volume so they survive restarts and
-# recreated containers.
-if [ -f "${STATE_DIR}/done" ]; then
-    log "Instance was already acquired in an earlier run. Nothing to do."
-    log "Delete ${STATE_DIR}/done to hunt again."
-    exit 0
-fi
-if [ -f "${STATE_DIR}/paused" ]; then
-    log "Paused: $(cat "${STATE_DIR}/paused" 2>/dev/null)"
-    log "Delete ${STATE_DIR}/paused, or run 'oracle-sniper resume', to continue."
-    exit 0
 fi
 
 # Any argument is passed straight through: docker run ... check
