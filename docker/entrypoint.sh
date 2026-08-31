@@ -74,10 +74,16 @@ if [ ! -r "${OCI_KEY_FILE:-$KEY_FILE}" ]; then
     exit 1
 fi
 
-# A previous run already won; nothing left to do.
+# Two brake files, both in the state volume so they survive restarts and
+# recreated containers.
 if [ -f "${STATE_DIR}/done" ]; then
     log "Instance was already acquired in an earlier run. Nothing to do."
     log "Delete ${STATE_DIR}/done to hunt again."
+    exit 0
+fi
+if [ -f "${STATE_DIR}/paused" ]; then
+    log "Paused: $(cat "${STATE_DIR}/paused" 2>/dev/null)"
+    log "Delete ${STATE_DIR}/paused, or run 'oracle-sniper resume', to continue."
     exit 0
 fi
 
@@ -92,7 +98,15 @@ oracle-sniper check || { log "Configuration check failed."; exit 1; }
 trap 'log "Stopping."; exit 0' TERM INT
 
 while :; do
+    # Checked every round, not just at startup -- so pausing takes effect
+    # without having to restart the container.
+    if [ -f "${STATE_DIR}/paused" ]; then
+        log "Paused. Exiting; remove the marker and start the container again."
+        exit 0
+    fi
+
     oracle-sniper run
+
     if [ -f "${STATE_DIR}/done" ]; then
         log "Done. Exiting so the container is not restarted."
         exit 0

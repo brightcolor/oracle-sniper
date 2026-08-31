@@ -5,7 +5,7 @@
 #
 # https://github.com/brightcolor/oracle-sniper
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 CONFIG_FILE="${ORACLE_SNIPER_CONFIG:-/etc/oracle-sniper/config}"
 LIB_DIR="${ORACLE_SNIPER_LIB:-/usr/local/lib/oracle-sniper}"
@@ -26,6 +26,8 @@ Usage: oracle-sniper <command>
 Commands:
   run            Try once to launch the instance (what the timer calls)
   status         Show timer state, target instance and recent attempts
+  pause          Stop hunting until resumed; survives restarts
+  resume         Undo pause
   check          Verify configuration and API access, change nothing
   test-notify    Send a test notification through every configured channel
   version        Print version
@@ -240,6 +242,19 @@ cmd_run() {
     load_config
     trap on_exit EXIT
 
+    # Two brakes, both files in the state directory so they survive a
+    # restart, a recreated container and a rebuilt image:
+    #   done     -- written automatically once an instance was acquired
+    #   paused   -- written by you, via `oracle-sniper pause`
+    if [ -f "${STATE_DIR}/paused" ]; then
+        log "Paused ($(cat "${STATE_DIR}/paused" 2>/dev/null)). Resume with: oracle-sniper resume"
+        CLEAN_EXIT=1; exit 0
+    fi
+    if [ -f "${STATE_DIR}/done" ]; then
+        log "Already acquired in an earlier run. Remove ${STATE_DIR}/done to hunt again."
+        CLEAN_EXIT=1; exit 0
+    fi
+
     exec 9>"${STATE_DIR}/lock"
     if ! flock -n 9; then
         log "Another run is in progress, skipping."
@@ -361,6 +376,28 @@ cmd_status() {
         | sed 's/^/  /' || echo "  (journal unavailable)"
 }
 
+cmd_pause() {
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    printf 'paused %s' "$(date -u +'%Y-%m-%d %H:%M:%S') UTC" > "${STATE_DIR}/paused"
+    echo "Paused. Runs will exit immediately, including after a restart."
+    echo "The file lives in the state volume: ${STATE_DIR}/paused"
+    echo "Resume with: oracle-sniper resume"
+}
+
+cmd_resume() {
+    if [ -f "${STATE_DIR}/paused" ]; then
+        rm -f "${STATE_DIR}/paused"
+        echo "Resumed."
+    else
+        echo "Not paused."
+    fi
+    if [ -f "${STATE_DIR}/done" ]; then
+        echo
+        echo "Note: ${STATE_DIR}/done still exists, so runs stop anyway."
+        echo "Delete it too if you want to hunt for another instance."
+    fi
+}
+
 cmd_test_notify() {
     load_config
     notify "oracle-sniper test" \
@@ -375,6 +412,8 @@ case "${1:-run}" in
     run)          cmd_run ;;
     check)        cmd_check ;;
     status)       cmd_status ;;
+    pause)        cmd_pause ;;
+    resume)       cmd_resume ;;
     test-notify)  cmd_test_notify ;;
     version)      echo "oracle-sniper ${VERSION}" ;;
     help|-h|--help) usage ;;

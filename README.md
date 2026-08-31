@@ -122,11 +122,26 @@ Your Oracle Cloud instance is never touched. If you delete the credentials, the 
 ```bash
 oracle-sniper status        # timer state, target instance, recent attempts
 oracle-sniper run           # try once, right now
+oracle-sniper pause         # stop hunting, survives restarts
+oracle-sniper resume        # carry on
 oracle-sniper check         # verify config and API access, change nothing
 oracle-sniper test-notify   # send a test through every configured channel
 ```
 
 In Docker, pass the same words to the container: `docker run ... oracle-sniper check`.
+
+### The two brake files
+
+Both live in the state directory — `/var/lib/oracle-sniper`, the mounted volume in Docker — so they survive a restart, a recreated container and a rebuilt image:
+
+| File | Written by | Meaning |
+|---|---|---|
+| `done` | the sniper itself, on success | An instance was acquired. Stop, permanently. |
+| `paused` | you, via `oracle-sniper pause` | Stop for now. |
+
+Either one makes a run exit immediately. In the container they are checked at startup **and before every round**, so pausing takes effect without a restart. Deleting the file is all it takes to continue — `resume` does exactly that, and warns you if `done` is still in the way.
+
+This is why the state volume matters. Drop it (`docker compose down -v`) and the sniper forgets that it already won — then starts hunting for a second instance, which Oracle bills.
 
 ---
 
