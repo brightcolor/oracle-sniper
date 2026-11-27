@@ -74,8 +74,8 @@ Pick one of the two routes.
 **Route A: let the console generate it.** Easiest if you are sitting at a browser.
 
 1. Sign in to the [OCI console](https://cloud.oracle.com/).
-2. Open the profile menu (the person icon at the top right) and choose **My profile**.
-3. Open **API keys**. In newer console versions it sits on the **Tokens and keys** tab.
+2. Open the profile menu (the person icon at the top right) and choose **My profile**. Some console versions call this entry **User settings**.
+3. Open **API keys**. In newer console versions it sits on the **Tokens and keys** tab; older ones list it under *Resources* on the left.
 4. Click **Add API key**, keep **Generate API key pair** selected, and click **Download private key**. Optionally download the public key too.
 5. Click **Add**.
 
@@ -89,7 +89,7 @@ chmod 600 api_key.pem
 openssl rsa -pubout -in api_key.pem -out api_key_public.pem
 ```
 
-Then, in the console under **My profile → API keys → Add API key**, choose **Paste a public key**, paste the contents of `api_key_public.pem` (including the `BEGIN` and `END` lines) and click **Add**.
+Then, in the console under **My profile** (or **User settings**) **→ API keys → Add API key**, choose **Paste a public key**, paste the contents of `api_key_public.pem` (including the `BEGIN` and `END` lines) and click **Add**.
 
 ### 2. Copy the values from the snippet
 
