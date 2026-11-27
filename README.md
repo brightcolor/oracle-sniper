@@ -63,6 +63,88 @@ No Python, no OCI CLI, no SDK. Requests are signed with `openssl` directly. The 
 
 ---
 
+## Create an Oracle API key
+
+oracle-sniper talks to Oracle's API with an **API signing key**: an RSA key pair whose public half is registered with your Oracle user, while the private half stays on the machine that runs the sniper. The installer can generate the pair for you and walks you through registering it. This section covers the same steps by hand, which is the way to go for Docker or when you want to understand what the installer asks for.
+
+### 1. Get a key pair
+
+Pick one of the two routes.
+
+**Route A: let the console generate it.** Easiest if you are sitting at a browser.
+
+1. Sign in to the [OCI console](https://cloud.oracle.com/).
+2. Open the profile menu (the person icon at the top right) and choose **My profile**.
+3. Open **API keys**. In newer console versions it sits on the **Tokens and keys** tab.
+4. Click **Add API key**, keep **Generate API key pair** selected, and click **Download private key**. Optionally download the public key too.
+5. Click **Add**.
+
+The download is the only copy of the private key Oracle ever gives you. Store it somewhere safe right away.
+
+**Route B: generate it yourself.** Useful on a headless server, because the private key is created there directly.
+
+```bash
+openssl genrsa -out api_key.pem 2048
+chmod 600 api_key.pem
+openssl rsa -pubout -in api_key.pem -out api_key_public.pem
+```
+
+Then, in the console under **My profile → API keys → Add API key**, choose **Paste a public key**, paste the contents of `api_key_public.pem` (including the `BEGIN` and `END` lines) and click **Add**.
+
+### 2. Copy the values from the snippet
+
+After **Add**, the console shows a *Configuration file preview*. It contains everything the sniper needs:
+
+```
+[DEFAULT]
+user=ocid1.user.oc1..aaaa...
+fingerprint=aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99
+tenancy=ocid1.tenancy.oc1..aaaa...
+region=eu-frankfurt-1
+key_file=<path to your private keys file>
+```
+
+| Snippet line | oracle-sniper setting |
+|---|---|
+| `user` | `OCI_USER` |
+| `fingerprint` | `OCI_FINGERPRINT` |
+| `tenancy` | `OCI_TENANCY`, and also `OCI_COMPARTMENT` unless you use a sub-compartment |
+| `region` | `OCI_REGION` |
+| `key_file` | `OCI_KEY_FILE`, the path to the private key on your host |
+
+You can open the snippet again later: the **⋮** menu next to the key in the API keys list has **View configuration file**.
+
+### 3. Hand the private key to the sniper
+
+- **systemd host:** run the installer and give it the path to your private key when it asks; it copies the key to `/etc/oracle-sniper/api_key.pem` with permissions `0600`. With route B you can also leave the prompt empty and let the installer generate a fresh pair, then paste the public key it prints.
+- **Docker:** mount the file read-only (`-v /path/to/api_key.pem:/etc/oracle-sniper/api_key.pem:ro`) or pass it as an environment variable:
+
+  ```bash
+  base64 -w0 < api_key.pem      # value for OCI_KEY_BASE64
+  ```
+
+### 4. Check that it works
+
+```bash
+oracle-sniper check
+```
+
+A freshly added key can take a minute before Oracle accepts it. If `check` still fails after that, compare the fingerprint of your local key with the one shown in the console:
+
+```bash
+openssl rsa -pubout -outform DER -in api_key.pem | openssl md5 -c
+```
+
+The two values have to match. If they differ, the key file belongs to a different key pair.
+
+### Good to know
+
+- Each Oracle user can hold **three API keys**. Delete keys you no longer use in the same list.
+- The private key grants full API access to your account. Keep it out of Git repositories, chat messages and screenshots, and give it permissions `0600`.
+- When you retire the sniper, delete the key in the console (**⋮ → Delete**). The uninstaller reminds you of this.
+
+---
+
 ## Docker
 
 The image is published for **linux/amd64 and linux/arm64**, so it runs on Ampere and Graviton instances as well as ordinary x86 hosts.
