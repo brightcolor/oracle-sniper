@@ -313,6 +313,18 @@ Full commentary lives in [`config.example`](config.example). The options you are
 
 ---
 
+## Releases
+
+CI assigns the version number when a pull request is merged into `main` ([`.github/workflows/release.yml`](.github/workflows/release.yml)). Pull requests leave the `VERSION="…"` lines in `bin/oracle-sniper` and `install.sh` and the tags as they are, so parallel pull requests each get their own number.
+
+- **Level:** exactly one label on the pull request: `major` for a breaking change, `minor` for a new feature, `patch` for a fix. A pull request without one of these labels counts as `patch`; with several, the highest wins. Set it when opening: `gh pr create --label minor`.
+- **On merge:** the run starts from the higher of the latest `vX.Y.Z` tag and the version on `main` before the merge (`bin/base-version`), computes the next number (`bin/next-version`), writes it into both files (`bin/write-version`), commits `Version X.Y.Z (Pull Request #N)` with `[skip ci]`, creates the annotated tag `vX.Y.Z` and starts the image build for that tag. Runs wait for each other. If the tag already exists, the run stops and says so.
+- **Numbers in text:** where a Markdown file needs the upcoming number, for example "since version …", write the placeholder <code>&#64;&#64;VERSION&#64;&#64;</code>. CI replaces it on merge.
+- **Images:** a release tag publishes `latest` and `X.Y.Z`. A manual run of *Container image* on a branch publishes `edge` only.
+- **Tests:** `bash tests/versioning.sh` checks the arithmetic, also with settings other than the defaults in `bin/versioning.env`. The *Checks* workflow runs it on every pull request.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
