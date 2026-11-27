@@ -1,0 +1,46 @@
+# Prüft jeden Pull Request: Syntax der Shell-Skripte und die Rechnung der Versionsvergabe (tests/versioning.sh).
+# Ändert ein Pull Request die Zeile VERSION="…", weist ein Hinweis darauf hin: Die Nummer vergibt release.yml beim Merge.
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Shell syntax check
+        run: |
+          set -euo pipefail
+          for f in bin/oracle-sniper bin/oci-api.sh bin/next-version bin/base-version bin/write-version bin/versioning.env docker/entrypoint.sh install.sh tests/versioning.sh; do
+            bash -n "$f" && echo "ok  $f"
+          done
+
+      - name: Versionsvergabe testen
+        run: bash tests/versioning.sh
+
+      - name: Hinweis zur Version
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          . bin/versioning.env
+          read -r -a files <<< "$VERSION_FILES"
+          if git diff "$BASE_SHA"...HEAD -- "${files[@]}" | grep -qE '^[+-]VERSION="'; then
+            echo "::warning::Dieser Pull Request ändert die Zeile VERSION=\"…\". Das zählt nicht: Die Nummer vergibt release.yml beim Merge aus dem Label major, minor oder patch. Bitte die Änderung zurücknehmen und das Label setzen."
+          fi

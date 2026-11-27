@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Trägt eine Version in alle Dateien ein, die eine Nummer tragen, und gibt die geänderten Dateien aus.
+#
+#   bin/write-version <Version>
+#
+# Setzt die Zeile VERSION="…" in jeder Datei aus VERSION_FILES und ersetzt den Platzhalter VERSION_PLACEHOLDER in
+# den versionierten Texten, die zu VERSION_PLACEHOLDER_FILES passen. Läuft im Wurzelverzeichnis eines
+# Git-Arbeitsstands. Einstellungen stehen in bin/versioning.env, der Ablauf in .github/workflows/release.yml.
+set -euo pipefail
+
+# shellcheck source=bin/versioning.env
+. "$(dirname "$0")/versioning.env"
+
+version="${1:-}"
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Die Version \"$version\" hat nicht die Form MAJOR.MINOR.PATCH, zum Beispiel 1.4.0. Bitte bin/next-version prüfen." >&2
+  exit 1
+fi
+
+read -r -a files <<< "$VERSION_FILES"
+for file in "${files[@]}"; do
+  if [ ! -f "$file" ]; then
+    echo "Die Datei $file fehlt. Bitte VERSION_FILES in bin/versioning.env prüfen." >&2
+    exit 1
+  fi
+  count="$(grep -c '^VERSION="[^"]*"' "$file" || true)"
+  if [ "$count" != 1 ]; then
+    echo "In $file steht die Zeile VERSION=\"…\" ${count}-mal, erwartet ist genau eine. Bitte die Datei prüfen." >&2
+    exit 1
+  fi
+  sed -i "s/^VERSION=\"[^\"]*\"/VERSION=\"$version\"/" "$file"
+  printf '%s\n' "$file"
+done
+
+placeholder_pattern="$(printf '%s' "$VERSION_PLACEHOLDER" | sed 's/[][\/.^$*&]/\\&/g')"
+read -r -a patterns <<< "$VERSION_PLACEHOLDER_FILES"
+while IFS= read -r -d '' text; do
+  if grep -qF -- "$VERSION_PLACEHOLDER" "$text"; then
+    sed -i "s/$placeholder_pattern/$version/g" "$text"
+    printf '%s\n' "$text"
+  fi
+done < <(git ls-files -z -- "${patterns[@]}")

@@ -1,0 +1,101 @@
+# Vergibt beim Merge eines Pull Requests nach main die nächste Version.
+#
+# Die Stufe kommt aus den Labels des Pull Requests: major, minor oder patch; ohne eines dieser Labels gilt patch.
+# Ausgangspunkt ist die höhere von zwei Angaben: dem letzten Tag vX.Y.Z und der Zeile VERSION="…" auf main vor dem
+# Merge (bin/base-version). Der Lauf schreibt die neue Nummer in bin/oracle-sniper und install.sh, ersetzt den
+# Platzhalter in den Markdown-Texten (bin/write-version), legt einen Commit mit [skip ci] und das annotierte Tag
+# vX.Y.Z an und stößt danach den Bau des Container-Images auf dem Tag an (docker.yml).
+#
+# Den Bau stößt dieser Lauf selbst an, weil ein Tag, das mit dem GITHUB_TOKEN gepusht wird, keine weiteren Workflows
+# startet. Die Läufe warten aufeinander. Die Beschreibung steht in der README (Abschnitt "Releases"), die
+# Einstellungen in bin/versioning.env.
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION_FILES: ${{ vars.VERSION_FILES }}
+      VERSION_PLACEHOLDER: ${{ vars.VERSION_PLACEHOLDER }}
+      VERSION_PLACEHOLDER_FILES: ${{ vars.VERSION_PLACEHOLDER_FILES }}
+      VERSION_TAG_PREFIX: ${{ vars.VERSION_TAG_PREFIX }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Nächste Version berechnen
+        id: version
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          . bin/versioning.env
+          base="$(bin/base-version "${MERGE_SHA}^1")"
+          new="$(bin/next-version "$base" "$LABELS")"
+          tag="${VERSION_TAG_PREFIX}${new}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::Das Tag $tag gibt es schon. Bitte die Tags und die Zeile VERSION=\"…\" in bin/oracle-sniper auf main prüfen, das Tag von Hand klären und den Lauf danach neu starten."
+            exit 1
+          fi
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Version $base wird zu $new (Labels: ${LABELS:-keine})"
+
+      - name: Version eintragen und Tag setzen
+        env:
+          NEW: ${{ steps.version.outputs.new }}
+          TAG: ${{ steps.version.outputs.tag }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "Geänderte Dateien:"
+          bin/write-version "$NEW"
+          git add -u
+          git commit -m "Version $NEW (Pull Request #$NUMBER)" -m "[skip ci]"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then break; fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::Der Push nach main ist dreimal gescheitert. Bitte prüfen, ob main geschützt ist oder gerade jemand pusht, und den Lauf danach neu starten."
+              exit 1
+            fi
+            git pull --rebase origin main
+          done
+          git tag -a "$TAG" -m "Version $NEW: $TITLE"
+          git push origin "$TAG"
+
+      - name: Container-Image bauen lassen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh workflow run docker.yml --ref "$TAG"; then
+            echo "::error::Der Bau des Images für $TAG ließ sich nicht starten. Bitte unter Actions → Container image → Run workflow das Tag $TAG auswählen und den Bau von Hand starten."
+            exit 1
+          fi
+          {
+            echo "### Version ${TAG}"
+            echo
+            echo "Tag gesetzt, Bau des Container-Images gestartet (Workflow *Container image*)."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,18 +1,18 @@
+# Baut das Multi-Arch-Image und veröffentlicht es auf ghcr.io.
+#
+# Ein Release-Tag vX.Y.Z bringt die Tags latest und X.Y.Z. Den Bau startet release.yml nach dem Setzen des Tags
+# (workflow_dispatch auf dem Tag), ein von Hand gepushtes Tag startet ihn ebenso. Ein Bau von Hand auf einem Branch
+# veröffentlicht nur das Tag aus BRANCH_IMAGE_TAG und lässt latest und die Versionsnummern unberührt.
 name: Container image
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
-    paths:
-      - 'Dockerfile'
-      - 'bin/**'
-      - 'docker/**'
-      - '.github/workflows/docker.yml'
   workflow_dispatch:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/oracle-sniper
+  BRANCH_IMAGE_TAG: ${{ vars.BRANCH_IMAGE_TAG || 'edge' }}
 
 jobs:
   build:
@@ -26,7 +26,7 @@ jobs:
       - name: Shell syntax check
         run: |
           set -euo pipefail
-          for f in bin/oracle-sniper bin/oci-api.sh docker/entrypoint.sh install.sh; do
+          for f in bin/oracle-sniper bin/oci-api.sh bin/next-version bin/base-version bin/write-version docker/entrypoint.sh install.sh; do
             bash -n "$f" && echo "ok  $f"
           done
 
@@ -45,14 +45,20 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
-          tags="${IMAGE}:latest"
           version="$(sed -n 's/^VERSION="\(.*\)"/\1/p' bin/oracle-sniper | head -1)"
-          [ -n "$version" ] && tags="${tags},${IMAGE}:${version}"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            t="${GITHUB_REF_NAME#v}"
-            tags="${tags},${IMAGE}:${t}"
+            if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+              echo "::error::Das Tag ${GITHUB_REF_NAME} passt nicht zur Zeile VERSION=\"${version}\" in bin/oracle-sniper. Bitte das Tag prüfen; die Nummer vergibt release.yml beim Merge."
+              exit 1
+            fi
+            primary="${IMAGE}:${version}"
+            tags="${IMAGE}:latest,${primary}"
+          else
+            primary="${IMAGE}:${BRANCH_IMAGE_TAG}"
+            tags="${primary}"
           fi
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "primary=${primary}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Building: ${tags}"
 
@@ -71,22 +77,32 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Verify both architectures
+        env:
+          PRIMARY: ${{ steps.meta.outputs.primary }}
         run: |
           set -euo pipefail
           echo "Published platforms:"
-          docker buildx imagetools inspect "${IMAGE}:latest" \
+          docker buildx imagetools inspect "${PRIMARY}" \
             | grep -o 'linux/[a-z0-9]*' | sort -u | sed 's/^/  /'
           for want in linux/amd64 linux/arm64; do
-            docker buildx imagetools inspect "${IMAGE}:latest" | grep -q "$want" \
+            docker buildx imagetools inspect "${PRIMARY}" | grep -q "$want" \
               || { echo "MISSING: $want"; exit 1; }
           done
           echo "Both architectures present."
 
       - name: Smoke test
+        env:
+          PRIMARY: ${{ steps.meta.outputs.primary }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
-          docker run --rm --entrypoint oracle-sniper "${IMAGE}:latest" version
-          docker run --rm --entrypoint sh "${IMAGE}:latest" -c \
+          reported="$(docker run --rm --entrypoint oracle-sniper "${PRIMARY}" version)"
+          echo "$reported"
+          if [ "$reported" != "oracle-sniper ${VERSION}" ]; then
+            echo "::error::Das Image meldet \"${reported}\", erwartet war \"oracle-sniper ${VERSION}\". Bitte bin/oracle-sniper und den Release-Commit prüfen."
+            exit 1
+          fi
+          docker run --rm --entrypoint sh "${PRIMARY}" -c \
             'for t in bash curl openssl flock base64; do command -v $t >/dev/null || { echo "missing: $t"; exit 1; }; done; echo "all tools present"'
 
       - name: Summary
@@ -95,7 +111,7 @@ jobs:
             echo "### Image published"
             echo
             echo '```'
-            echo "docker pull ${IMAGE}:latest"
+            echo "docker pull ${{ steps.meta.outputs.primary }}"
             echo '```'
             echo
             echo "Platforms: linux/amd64, linux/arm64"

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Gibt die Version aus, von der aus die CI die nächste berechnet.
+#
+#   bin/base-version [<Commit>]
+#
+# Das ist die höhere von zwei Angaben: dem letzten Tag vX.Y.Z im Repository und der Zeile VERSION="…" in der ersten
+# Datei aus VERSION_FILES am <Commit> (Vorgabe HEAD). Die CI übergibt den Stand von main vor dem Merge. Das Tag zählt
+# mit, damit zwei kurz nacheinander gemergte Pull Requests verschiedene Nummern bekommen: Der zweite Lauf sieht das
+# Tag des ersten, auch wenn sein eigener Merge-Commit die alte Nummer trägt.
+#
+# Läuft im Wurzelverzeichnis eines Git-Arbeitsstands. Einstellungen stehen in bin/versioning.env.
+set -euo pipefail
+
+# shellcheck source=bin/versioning.env
+. "$(dirname "$0")/versioning.env"
+
+commit="${1:-HEAD}"
+read -r -a files <<< "$VERSION_FILES"
+source_file="${files[0]}"
+
+if ! content="$(git show "$commit:$source_file" 2>/dev/null)"; then
+  echo "Die Datei $source_file gibt es am Stand $commit nicht. Bitte VERSION_FILES in bin/versioning.env prüfen." >&2
+  exit 1
+fi
+file_version="$(printf '%s\n' "$content" | sed -n 's/^VERSION="\([^"]*\)".*/\1/p' | head -1)"
+if [[ ! "$file_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "In $source_file steht am Stand $commit keine Zeile VERSION=\"X.Y.Z\" (gefunden: \"$file_version\"). Bitte die Zeile in der Datei prüfen." >&2
+  exit 1
+fi
+
+for other in "${files[@]:1}"; do
+  other_version="$(git show "$commit:$other" 2>/dev/null | sed -n 's/^VERSION="\([^"]*\)".*/\1/p' | head -1 || true)"
+  if [ "$other_version" != "$file_version" ]; then
+    echo "Hinweis: $other trägt die Version \"$other_version\", $source_file die Version \"$file_version\". Die CI gleicht beide beim Eintragen an." >&2
+  fi
+done
+
+tag_version=""
+while IFS= read -r tag; do
+  if [[ "$tag" =~ ^"$VERSION_TAG_PREFIX"([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    tag_version="$(printf '%s\n%s\n' "$tag_version" "${BASH_REMATCH[1]}" | sed '/^$/d' | sort -V | tail -1)"
+  fi
+done < <(git tag -l)
+
+printf '%s\n%s\n' "$file_version" "$tag_version" | sed '/^$/d' | sort -V | tail -1
